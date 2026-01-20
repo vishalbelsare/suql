@@ -4,6 +4,7 @@ Functionality to work with .prompt files
 
 import logging
 import os
+import re
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -103,6 +104,16 @@ def _generate(
             "api_version": api_version,
             "api_key": api_key,
         }
+
+        # LiteLLM/OpenAI parameter compatibility:
+        # Some newer OpenAI models (e.g., gpt-5*) reject classic sampling/penalty params.
+        # If we detect gpt-5*, drop these params to avoid 500s from UnsupportedParamsError.
+        model_name = str(engine) if engine is not None else ""
+        if re.search(r"(^|/|-)gpt-5", model_name):
+            kwargs.pop("top_p", None)
+            kwargs.pop("frequency_penalty", None)
+            kwargs.pop("presence_penalty", None)
+            kwargs.pop("stop", None)
 
         generation_output = chat_completion_with_backoff(**kwargs)
         generation_output = no_line_break_start + generation_output

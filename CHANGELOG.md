@@ -3,6 +3,31 @@
 All notable changes to SUQL are documented in this file. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+- **`answer()` over a computed text expression (issue #50).** The text argument
+  of a free-text function no longer has to be a bare column: `answer(COALESCE(a,
+  '') || ' ' || COALESCE(b, ''), '...')`, `answer(lower(notes), '...')` and any
+  other text-typed SQL expression now work, instead of tripping
+  `assert len(field_lst) == 1` in `breakdown_unstructural_query`. The compiler
+  projects the expression in the structural query under an internal
+  `_suql_expr_<hash>` alias (stripped again before results are returned), so
+  Postgres evaluates it once per row and the LLM verifies the expression's own
+  value. Retrieval falls back to the FAISS indexes of the columns the
+  expression reads from — an unindexed column is skipped with a warning, and
+  when nothing is retrievable the compiler verifies every surviving row, or
+  raises if that would exceed 1000 rows (pass `disable_retriever=True` to force
+  it). The text argument and the question are now read positionally, so a
+  string literal as the text argument no longer confuses the parser either.
+- **Table-qualified projections with `answer()`.** `SELECT e.event_id_cnty FROM
+  events e WHERE answer(...)` failed with `missing FROM-clause entry for table
+  "events"`: the FROM clause is swapped for the temp table holding the verified
+  rows, which left qualified references dangling. The temp table now carries
+  the original table name as an alias.
+- `answer()` on a NULL text value is now `False` instead of raising an
+  `AssertionError` inside verification.
+
 ## [1.1.10a3] - 2026-05-13
 
 ### Added

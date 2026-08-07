@@ -1,5 +1,6 @@
 import concurrent.futures
 import contextvars
+import hashlib
 import json
 import logging
 import random
@@ -10,7 +11,7 @@ import traceback
 from collections import defaultdict
 from copy import deepcopy
 from functools import lru_cache
-from typing import Dict, List, Union
+from typing import Dict, List, NamedTuple, Union
 from uuid import uuid4
 
 import pglast
@@ -71,6 +72,146 @@ def _if_contains_free_text_fcn(node):
     return visitor.res
 
 
+def _if_free_text_fcn(node):
+    """True if `node` is itself a call to a free text function (`answer`)."""
+    return isinstance(node, FuncCall) and any(
+        i.sval in _SET_FREE_TEXT_FCNS for i in node.funcname if isinstance(i, String)
+    )
+
+
+# Prefix for the synthetic columns under which computed text arguments of
+# `answer()` (e.g. `COALESCE(notes,'') || ' ' || COALESCE(tags,'')`) are
+# projected by the structural query. These are internal to the compiler and are
+# stripped before results reach the user (see issue #50).
+_INTERNAL_EXPR_COLUMN_PREFIX = "_suql_expr_"
+
+
+class _ComputedTextField(NamedTuple):
+    """Identifies the text input of a free text function when that input is a
+    computed SQL expression instead of a bare column reference, e.g.
+    `answer(COALESCE(notes,'') || ' ' || COALESCE(tags,''), '...')`.
+
+    Interchangeable with the usual `(table, column)` field tuple: index 0 is the
+    table the expression is drawn from ("" if it cannot be determined, e.g.
+    joins), and index 1 is the synthetic alias under which the structural query
+    materializes the expression's value. `expr_sql` keeps the original SQL text
+    for prompts and logging, and `source_columns` lists the real (table, column)
+    pairs the expression reads - the only things the retriever can prefilter on.
+    """
+
+    table: str
+    column: str
+    expr_sql: str
+    source_columns: tuple = ()
+
+
+def _computed_text_alias(expr_sql: str):
+    """Deterministic projection alias for a computed text expression. Derived
+    from the expression's SQL text so that the structural query and the
+    verification step independently agree on the same name."""
+    digest = hashlib.md5(expr_sql.encode("utf-8")).hexdigest()[:12]
+    return _INTERNAL_EXPR_COLUMN_PREFIX + digest
+
+
+def _free_text_fcn_args(free_text_clause: FuncCall):
+    """Returns the (text argument node, question string) of a free text function
+    call. The text argument is positional - it may be a bare `ColumnRef` or any
+    computed text expression."""
+    args = free_text_clause.args if free_text_clause.args else ()
+    func_name = ".".join(
+        i.sval for i in free_text_clause.funcname if isinstance(i, String)
+    )
+    if len(args) < 2:
+        raise ValueError(
+            "expects '{}' to be called with a text argument and a question, "
+            "but got: {}".format(func_name, RawStream()(free_text_clause))
+        )
+    query_arg = args[1]
+    if not (isinstance(query_arg, A_Const) and isinstance(query_arg.val, String)):
+        raise ValueError(
+            "expects the question argument of '{}' to be a string literal, "
+            "but got: {}".format(func_name, RawStream()(free_text_clause))
+        )
+    return args[0], query_arg.val.sval
+
+
+class _ExtractComputedTextArgs(Visitor):
+    """Collects the text arguments of free text function calls that are computed
+    SQL expressions rather than bare column references, keyed by the synthetic
+    alias they will be projected under."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.res: Dict[str, object] = {}
+
+    def __call__(self, node):
+        if node is None:
+            return
+        super().__call__(node)
+
+    def visit_FuncCall(self, ancestors, node: FuncCall):
+        if not _if_free_text_fcn(node):
+            return
+        text_arg, _ = _free_text_fcn_args(node)
+        if isinstance(text_arg, ColumnRef):
+            return
+        self.res[_computed_text_alias(RawStream()(text_arg))] = text_arg
+
+
+def _extract_computed_text_args(node):
+    visitor = _ExtractComputedTextArgs()
+    visitor(node)
+    return visitor.res
+
+
+class _ExtractColumnRefs(Visitor):
+    """Collects every `ColumnRef` appearing under a node, in order."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.res = []
+
+    def __call__(self, node):
+        if node is None:
+            return
+        super().__call__(node)
+
+    def visit_ColumnRef(self, ancestors, node: ColumnRef):
+        self.res.append(node)
+
+
+def _extract_column_refs(node):
+    visitor = _ExtractColumnRefs()
+    visitor(node)
+    return visitor.res
+
+
+def _field_display_name(field):
+    """Human-readable name of the text source, used in verification prompts and
+    logging. For computed expressions, the synthetic alias means nothing to an
+    LLM - show the expression instead."""
+    if isinstance(field, _ComputedTextField):
+        return field.expr_sql
+    return field[1]
+
+
+def _drop_internal_columns(results, column_info):
+    """Removes the synthetic computed-expression columns (see
+    `_INTERNAL_EXPR_COLUMN_PREFIX`) from a result set, so that they neither
+    reach the user nor the temporary tables built from these results."""
+    keep = [
+        i
+        for i, column in enumerate(column_info)
+        if not str(column[0]).startswith(_INTERNAL_EXPR_COLUMN_PREFIX)
+    ]
+    if len(keep) == len(column_info):
+        return results, column_info
+    return (
+        [tuple(row[i] for i in keep) for row in results],
+        [column_info[i] for i in keep],
+    )
+
+
 def _extract_all_free_text_fcns(suql):
     node = parse_sql(suql)
     visitor = _ExtractAllFreeTextFncs()
@@ -91,14 +232,13 @@ class _ExtractAllFreeTextFncs(Visitor):
     def visit_FuncCall(self, ancestors, node: pglast.ast.FuncCall):
         for i in node.funcname:
             if i.sval in self._SET_FREE_TEXT_FCNS:
-                query_lst = list(filter(lambda x: isinstance(x, A_Const), node.args))
-                assert len(query_lst) == 1
-                query = query_lst[0].val.sval
+                text_arg, query = _free_text_fcn_args(node)
 
-                field_lst = list(filter(lambda x: isinstance(x, ColumnRef), node.args))
-                assert len(field_lst) == 1
-
-                field = tuple(map(lambda x: x.sval, field_lst[0].fields))
+                if isinstance(text_arg, ColumnRef):
+                    field = tuple(map(lambda x: x.sval, text_arg.fields))
+                else:
+                    # computed text expression (issue #50)
+                    field = (RawStream()(text_arg),)
 
                 self.res.append((field, query))
 
@@ -329,6 +469,11 @@ class _SelectVisitor(Visitor):
                 enable_classifier=self.enable_classifier,
             )
 
+            # computed text expressions given to answer() are projected under
+            # internal aliases (issue #50) - they have served their purpose by
+            # now and must not leak into the temp table or the user's results
+            results, column_info = _drop_internal_columns(results, column_info)
+
             # based on results and column_info, insert a temporary table
             column_create_stmt = ",\n".join(
                 list(map(lambda x: f'"{x[0]}" {x[1]}', column_info))
@@ -380,8 +525,25 @@ class _SelectVisitor(Visitor):
                     )
 
             # finally, modify the existing sql with tmp_table_name
+            # For a single table, the rest of the query may still refer to its
+            # columns table-qualified (`SELECT events.event_id_cnty ...`, or an
+            # alias that _replace_table_aliases turned into the table name).
+            # Alias the temp table back to that name so those references keep
+            # resolving. Joins don't need this - _Replace_Original_Target_Visitor
+            # already rewrote their references to the "table^column" form.
+            original_from = node.fromClause
+            table_alias = (
+                Alias(aliasname=original_from[0].relname)
+                if len(original_from) == 1 and isinstance(original_from[0], RangeVar)
+                else None
+            )
             node.fromClause = (
-                RangeVar(relname=tmp_table_name, inh=True, relpersistence="p"),
+                RangeVar(
+                    relname=tmp_table_name,
+                    inh=True,
+                    relpersistence="p",
+                    alias=table_alias,
+                ),
             )
             node.whereClause = None
         elif self.enable_classifier:
@@ -933,7 +1095,8 @@ def _verify(
         template_file="prompts/verification.prompt",
         prompt_parameter_values={
             "document": document,
-            "field": field[1],  # field is a tuple (table_name, field_name)
+            # field is a tuple (table_name, field_name), or a _ComputedTextField
+            "field": _field_display_name(field),
             "query": query,
             "answer": answer,
         },
@@ -968,6 +1131,10 @@ def _verify_single_res(
         # for a list, verify against each one, if any returns true then return that
         def verify_single_value(single_value, single_column_name):
             res = False
+            # NULL text (empty column, or a computed expression that evaluated
+            # to NULL) can never satisfy the predicate
+            if single_value is None:
+                return False
             # if this is a string, then directly verify:
             if isinstance(single_value, str):
                 res = _verify(
@@ -1031,7 +1198,7 @@ def _verify_single_res(
                     break
 
         else:
-            if not _verify(
+            if doc[1][i] is None or not _verify(
                 doc[1][i],
                 field,
                 query,
@@ -1047,7 +1214,12 @@ def _verify_single_res(
             else:
                 found_stmt.append(
                     "Verified answer({}, '{}') {} {} in table = {} based on document: {}".format(
-                        field[1], query, operator, value, field[0], doc[1][i]
+                        _field_display_name(field),
+                        query,
+                        operator,
+                        value,
+                        field[0],
+                        doc[1][i],
                     )
                 )
     if all_found:
@@ -1107,6 +1279,123 @@ def _parallel_filtering(fcn, source: list, limit, enforce_ordering=False):
     return true_items
 
 
+# Upper bound on how many rows the compiler is willing to send to the LLM when
+# it falls back to brute-force verification on its own (i.e., the user did not
+# ask for `disable_retriever=True`). Verification is one LLM call per row, so a
+# silent fallback on a large table would be ruinous - error out instead.
+_MAX_IMPLICIT_BRUTE_FORCE_ROWS = 1000
+
+
+def _search_embedding_server(
+    embedding_server_address, column, query, id_list, top, single_table
+):
+    """Runs one /search call against a single (table, column) FAISS index.
+    Returns the server's result list, or None if that index is unavailable."""
+    try:
+        response = requests.post(
+            embedding_server_address + "/search",
+            json={
+                "id_list": id_list,
+                "field_query_list": [(list(column), query)],
+                "top": top,
+                "single_table": single_table,
+            },
+            headers={"Content-Type": "application/json"},
+        )
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        logging.warning(
+            "retrieval on column {}.{} failed ({}); the embedding server "
+            "likely does not index it".format(column[0], column[1], e)
+        )
+        return None
+    return response.json()["result"]
+
+
+def _retrieve_candidate_ids(
+    field_query_list, id_list, single_table, top, embedding_server_address
+):
+    """Prefilters rows for predicates whose text input is a computed expression
+    (issue #50). The expression itself has no FAISS index, so each predicate is
+    retrieved on the indexed columns its expression reads from, unioning the
+    hits across those columns. Predicates are ANDed, so the per-predicate id
+    sets are intersected, keeping the first predicate's relevance order.
+
+    Returns None if retrieval was impossible for at least one predicate, in
+    which case the caller has to verify rows without a prefilter.
+    """
+    per_predicate = []
+    for entry in field_query_list:
+        field, query = entry[0], entry[1]
+        source_columns = (
+            field.source_columns
+            if isinstance(field, _ComputedTextField)
+            else (tuple(field),)
+        )
+
+        ordered_ids = []
+        seen = set()
+        retrieved = False
+        for column in source_columns:
+            res = _search_embedding_server(
+                embedding_server_address, column, query, id_list, top, single_table
+            )
+            if res is None:
+                continue
+            retrieved = True
+            for row in res:
+                row_ids = row[0] if isinstance(row[0], list) else [row[0]]
+                for row_id in row_ids:
+                    if row_id not in seen:
+                        seen.add(row_id)
+                        ordered_ids.append(row_id)
+
+        if not retrieved:
+            return None
+        per_predicate.append((ordered_ids, seen))
+
+    if not per_predicate:
+        return None
+    common = set.intersection(*[seen for _, seen in per_predicate])
+    return [row_id for row_id in per_predicate[0][0] if row_id in common]
+
+
+def _read_field_values(
+    field_query_list, existing_results, column_info, id_index, single_table, keep_ids
+):
+    """Builds the `[id, [document per predicate]]` structure the verification
+    step consumes, reading each predicate's text straight off the structural
+    query's rows (rather than from the retriever).
+
+    `keep_ids` is an ordered list of row ids to keep, or None to keep every row.
+    """
+    column_names = [x[0] for x in column_info]
+    field_indices = []
+    for field_entry in field_query_list:
+        field = field_entry[0]
+        if isinstance(field, _ComputedTextField):
+            # computed expressions are projected under their synthetic alias
+            # verbatim, in both single-table and join queries
+            target = field.column
+        else:
+            table_part, col_part = field
+            target = col_part if single_table else f"{table_part}^{col_part}"
+        field_indices.append(column_names.index(target))
+
+    if keep_ids is None:
+        rows = existing_results
+    else:
+        by_id = defaultdict(list)
+        for existing_res in existing_results:
+            by_id[existing_res[id_index]].append(existing_res)
+        rows = [row for row_id in keep_ids for row in by_id[row_id]]
+
+    return [
+        [row[id_index], [row[i] for i in field_indices]]
+        for row in rows
+    ]
+
+
 def _retrieve_and_verify(
     node: SelectStmt,
     field_query_list,
@@ -1133,6 +1422,14 @@ def _retrieve_and_verify(
     # existing_results: existing results to run retrieval on, this is a list of tuples
     # column_info: this is a list of tuples, first element is column name and second is type
     # limit: max number of returned results
+
+    # The retriever is keyed by (table, column) - it has no FAISS index for a
+    # computed text expression like `COALESCE(notes,'') || ' ' || tags`, so
+    # those predicates take a separate retrieval path (issue #50).
+    has_computed_field = any(
+        isinstance(x[0], _ComputedTextField) for x in field_query_list
+    )
+
     if len(node.fromClause) == 1 and isinstance(node.fromClause[0], RangeVar):
         id_field_name = table_w_ids[node.fromClause[0].relname]
         single_table = True
@@ -1177,16 +1474,48 @@ def _retrieve_and_verify(
         # verification on every row that survived the structural prefilter.
         # `field_query_list` carries (table, column) tuples; column_info carries
         # bare column names for single-table queries and "table^column" for joins.
-        column_names = [x[0] for x in column_info]
-        parsed_result = []
-        for existing_res in existing_results:
-            intermediate_result = []
-            for field_entry in field_query_list:
-                table_part, col_part = field_entry[0]
-                target = col_part if single_table else f"{table_part}^{col_part}"
-                field_index = column_names.index(target)
-                intermediate_result.append(existing_res[field_index])
-            parsed_result.append([existing_res[id_index], intermediate_result])
+        parsed_result = _read_field_values(
+            field_query_list,
+            existing_results,
+            column_info,
+            id_index,
+            single_table,
+            keep_ids=None,
+        )
+    elif has_computed_field:
+        # Retrieve on the indexed columns that the computed expressions read
+        # from, but verify against the expression's own value, which the
+        # structural query already materialized for every row (issue #50).
+        candidate_ids = _retrieve_candidate_ids(
+            field_query_list,
+            id_list,
+            single_table,
+            limit * max_verify,
+            embedding_server_address,
+        )
+        if candidate_ids is None:
+            if len(existing_results) > _MAX_IMPLICIT_BRUTE_FORCE_ROWS:
+                raise NotImplementedError(
+                    "answer() is called on a computed text expression that the "
+                    "retriever cannot prefilter on, and {} rows survive the "
+                    "structural filter - verifying them all would mean one LLM "
+                    "call per row. Narrow the query with structural predicates, "
+                    "make answer() read an embedded column directly, or pass "
+                    "disable_retriever=True to run the LLM on every row "
+                    "anyway.".format(len(existing_results))
+                )
+            logging.warning(
+                "no retrievable column backs the computed text expression(s); "
+                "verifying every row that survives the structural filter"
+            )
+        parsed_result = _read_field_values(
+            field_query_list,
+            existing_results,
+            column_info,
+            id_index,
+            single_table,
+            keep_ids=candidate_ids,
+        )
     elif fetch_all:
         # first get all free text fields:
         all_free_text_columns = []
@@ -1939,6 +2268,18 @@ def _execute_structural_sql(
     else:
         node.targetList = (ResTarget(val=ColumnRef(fields=(A_Star(),))),)
 
+    # Free text functions can take a computed text expression instead of a bare
+    # column, e.g. answer(COALESCE(notes,'') || ' ' || COALESCE(tags,''), '...').
+    # Project those expressions under a deterministic alias so that Postgres
+    # evaluates them once per row, and the LLM verification step can read the
+    # resulting string off each row (see issue #50). These columns are internal
+    # and get stripped before results are returned (_drop_internal_columns).
+    computed_text_args = _extract_computed_text_args(original_node.whereClause)
+    node.targetList = tuple(node.targetList) + tuple(
+        ResTarget(name=alias, val=deepcopy(expr))
+        for alias, expr in sorted(computed_text_args.items())
+    )
+
     # reset all limits
     node.limitCount = None
     node.limitOffset = None
@@ -2020,6 +2361,85 @@ def _execute_free_text_queries(
                 raise ValueError()
         return tuple(res)
 
+    def _extract_value_clause(value_clause):
+        if isinstance(value_clause, tuple):
+            return extract_tuple_value(value_clause)
+        elif isinstance(value_clause.val, String):
+            return value_clause.val.sval
+        elif isinstance(value_clause.val, Integer):
+            return value_clause.val.ival
+        else:
+            raise ValueError()
+
+    def resolve_column_ref(column_ref: ColumnRef):
+        """Resolves a `ColumnRef` to a (table, column) tuple, using the FROM
+        clause and the structural query's column names. Returns None for a
+        wildcard (`*` / `t.*`), which names no single column to retrieve on."""
+        if any(isinstance(x, A_Star) for x in column_ref.fields):
+            return None
+        field = tuple(x.sval for x in column_ref.fields if isinstance(x, String))
+        if len(field) > 1:
+            assert len(field) == 2
+            return field
+
+        # we need to find out the associated table for this field
+        if len(node.fromClause) == 1 and isinstance(node.fromClause[0], RangeVar):
+            return (node.fromClause[0].relname, field[0])
+
+        for column_name, _ in column_info:
+            if "^" not in column_name:
+                continue
+            else:
+                if column_name.split("^")[1] == field[0]:
+                    return tuple(column_name.split("^"))
+        return field
+
+    def resolve_cte_lineage(field, strict):
+        """If `field` references a CTE that we materialized, rewrites it to
+        point at the underlying real table so the embedding server can find the
+        right FAISS index (which is keyed by real-table name, not CTE name).
+        Built per-CTE during `_process_ctes`.
+
+        Returns None when the column cannot be traced back to a real table and
+        `strict` is False; raises in that same situation when `strict` is True.
+        """
+        if field is None or not cte_column_lineage or len(field) != 2:
+            return field
+        cte_name, col_name = field
+        lineage_entry = cte_column_lineage.get(cte_name)
+        if lineage_entry is None:
+            return field
+        resolved = lineage_entry.get(col_name)
+        if resolved is not None:
+            return resolved
+        if disable_retriever:
+            return field
+        # Known CTE but this column has no lineage — likely a
+        # computed expression (e.g. LOWER(col) AS x). Without
+        # FAISS embeddings for it, the retriever can't help.
+        if not strict:
+            return None
+        raise NotImplementedError(
+            f"answer() targets column {col_name!r} of CTE "
+            f"{cte_name!r}, but this column has no traceable "
+            f"lineage to a real table (likely a computed "
+            f"expression). Rewrite the CTE to project the "
+            f"underlying column directly, or pass "
+            f"disable_retriever=True to bypass the retriever."
+        )
+
+    def resolve_source_columns(text_arg):
+        """Real (table, column) pairs that a computed text expression draws
+        from. These are what the retriever can prefilter on - the expression
+        itself has no FAISS index."""
+        res = []
+        for column_ref in _extract_column_refs(text_arg):
+            column = resolve_cte_lineage(resolve_column_ref(column_ref), strict=False)
+            if column is None or len(column) != 2 or column in res:
+                continue
+            res.append(column)
+        return tuple(res)
+
     def breakdown_unstructural_query(predicate: A_Expr):
         assert _if_contains_free_text_fcn(
             predicate.lexpr
@@ -2046,70 +2466,36 @@ def _execute_free_text_queries(
         assert isinstance(free_text_clause, FuncCall)
         assert assert_A_Const_Or_Tuple_A_Const(value_clause)
 
-        query_lst = list(
-            filter(lambda x: isinstance(x, A_Const), free_text_clause.args)
-        )
-        assert len(query_lst) == 1
-        query = query_lst[0].val.sval
+        text_arg, query = _free_text_fcn_args(free_text_clause)
 
-        field_lst = list(
-            filter(lambda x: isinstance(x, ColumnRef), free_text_clause.args)
-        )
-        assert len(field_lst) == 1
-
-        field = tuple(map(lambda x: x.sval, field_lst[0].fields))
-        if len(field) > 1:
-            assert len(field) == 2
+        # The text argument can be an arbitrary text-typed expression (issue
+        # #50). Anything other than a bare column has already been projected by
+        # the structural query under a synthetic alias - point the field there.
+        if not isinstance(text_arg, ColumnRef):
+            expr_sql = RawStream()(text_arg)
+            table_name = (
+                node.fromClause[0].relname
+                if len(node.fromClause) == 1
+                and isinstance(node.fromClause[0], RangeVar)
+                else ""
+            )
+            field = _ComputedTextField(
+                table=table_name,
+                column=_computed_text_alias(expr_sql),
+                expr_sql=expr_sql,
+                source_columns=resolve_source_columns(text_arg),
+            )
         else:
-            # we need to find out the associated table for this field
-            if len(node.fromClause) == 1 and isinstance(node.fromClause[0], RangeVar):
-                field = (
-                    node.fromClause[0].relname,
-                    field_lst[0].fields[0].sval,
+            field = resolve_cte_lineage(resolve_column_ref(text_arg), strict=True)
+            if field is None:
+                raise ValueError(
+                    "the text argument of a free text function must name a "
+                    "column or be a text expression, but is a wildcard: "
+                    "{}".format(RawStream()(free_text_clause))
                 )
-            else:
-                for column_name, _ in column_info:
-                    if "^" not in column_name:
-                        continue
-                    else:
-                        if column_name.split("^")[1] == field_lst[0].fields[0].sval:
-                            field = tuple(column_name.split("^"))
-
-        # If the resolved field references a CTE that we materialized,
-        # rewrite to point at the underlying real table so the embedding
-        # server can find the right FAISS index (which is keyed by
-        # real-table name, not CTE name). Built per-CTE during _process_ctes.
-        if cte_column_lineage and len(field) == 2:
-            cte_name, col_name = field
-            lineage_entry = cte_column_lineage.get(cte_name)
-            if lineage_entry is not None:
-                resolved = lineage_entry.get(col_name)
-                if resolved is not None:
-                    field = resolved
-                elif not disable_retriever:
-                    # Known CTE but this column has no lineage — likely a
-                    # computed expression (e.g. LOWER(col) AS x). Without
-                    # FAISS embeddings for it, the retriever can't help.
-                    raise NotImplementedError(
-                        f"answer() targets column {col_name!r} of CTE "
-                        f"{cte_name!r}, but this column has no traceable "
-                        f"lineage to a real table (likely a computed "
-                        f"expression). Rewrite the CTE to project the "
-                        f"underlying column directly, or pass "
-                        f"disable_retriever=True to bypass the retriever."
-                    )
 
         operator = predicate.name[0].sval
-        if isinstance(value_clause, tuple):
-            value = extract_tuple_value(value_clause)
-        elif isinstance(value_clause.val, String):
-            value = value_clause.val.sval
-        elif isinstance(value_clause.val, Integer):
-            value = value_clause.val.ival
-        else:
-            raise ValueError()
-
-        return field, query, operator, value
+        return field, query, operator, _extract_value_clause(value_clause)
 
     # TODO: handle cases with NOT
 
@@ -2317,6 +2703,12 @@ class _FindTableAliasVisitor(Visitor):
         super().__call__(node)
         
     def visit_RangeVar(self, ancestors: Ancestor, node: RangeVar):
+        # Temp tables carry a compatibility alias that visit_SelectStmt adds
+        # after their subtree was already analyzed. Rewriting references to it
+        # here would be wrong (and two temp tables can share the alias name).
+        if node.relname.startswith("temp_table_"):
+            return
+
         if node.alias and isinstance(node.alias, Alias) and node.alias.aliasname:
             self.alias_mapping[node.alias.aliasname] = node.relname
             

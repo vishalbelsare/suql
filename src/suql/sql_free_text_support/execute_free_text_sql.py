@@ -3,12 +3,14 @@ import contextvars
 import hashlib
 import json
 import logging
+import os
 import random
 import re
 import string
 import time
 import traceback
 from collections import defaultdict
+from contextlib import contextmanager
 from copy import deepcopy
 from functools import lru_cache
 from typing import Dict, List, NamedTuple, Union
@@ -22,7 +24,7 @@ from pglast.ast import *
 from pglast.enums.parsenodes import A_Expr_Kind
 from pglast.enums.primnodes import BoolExprType, CoercionForm
 from pglast.stream import RawStream
-from pglast.visitors import Ancestor, Visitor
+from pglast.visitors import Ancestor, Skip, Visitor
 from psycopg2 import Error as psyconpg2Error
 from sympy import Symbol, symbols
 from sympy.logic.boolalg import And, Not, Or, to_dnf
@@ -57,6 +59,10 @@ class _FreeTextFcnVisitor(Visitor):
         self.res = False
 
     def __call__(self, node):
+        # absent clauses (a missing WHERE, the empty side of a unary operator)
+        # contain no free text functions
+        if node is None:
+            return
         super().__call__(node)
 
     def visit_FuncCall(self, ancestors, node: pglast.ast.FuncCall):
@@ -212,6 +218,310 @@ def _drop_internal_columns(results, column_info):
     )
 
 
+# Prefix for the synthetic boolean columns that hold the verified value of a
+# free text comparison appearing outside the WHERE clause (see
+# `_verify_projection_predicates`). Unlike `_INTERNAL_EXPR_COLUMN_PREFIX` these
+# columns are *referenced* by the rewritten query, so they do live in the temp
+# table; `*` is expanded explicitly so they don't leak into the user's results.
+_INTERNAL_PRED_COLUMN_PREFIX = "_suql_pred_"
+
+# Aggregates may not appear in the text argument of a free text function that
+# the compiler evaluates: the compiler reads that argument off the structural
+# query one value per *input* row, before any grouping has happened.
+_KNOWN_AGGREGATE_FCNS = frozenset(
+    [
+        "array_agg",
+        "avg",
+        "bit_and",
+        "bit_or",
+        "bool_and",
+        "bool_or",
+        "count",
+        "every",
+        "json_agg",
+        "json_object_agg",
+        "jsonb_agg",
+        "jsonb_object_agg",
+        "max",
+        "min",
+        "stddev",
+        "stddev_pop",
+        "stddev_samp",
+        "string_agg",
+        "sum",
+        "var_pop",
+        "var_samp",
+        "variance",
+    ]
+)
+
+
+class _ContainsAggregate(Visitor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.res = False
+
+    def __call__(self, node):
+        if node is None:
+            return
+        super().__call__(node)
+
+    def visit_FuncCall(self, ancestors, node: FuncCall):
+        if node.agg_star or node.agg_distinct or node.agg_order or node.agg_filter:
+            self.res = True
+            return
+        name = ".".join(i.sval for i in node.funcname if isinstance(i, String))
+        if name.rsplit(".", 1)[-1].lower() in _KNOWN_AGGREGATE_FCNS:
+            self.res = True
+
+
+def _contains_aggregate(node):
+    visitor = _ContainsAggregate()
+    visitor(node)
+    return visitor.res
+
+
+def _projection_predicate_alias(predicate_sql: str):
+    """Deterministic column name for a verified free text comparison. Derived
+    from the comparison's SQL text so the same comparison written twice (e.g. in
+    both the projection and ORDER BY) is verified once."""
+    digest = hashlib.md5(predicate_sql.encode("utf-8")).hexdigest()[:12]
+    return _INTERNAL_PRED_COLUMN_PREFIX + digest
+
+
+def _if_projection_predicate(node):
+    """True if `node` is an `answer(...) <op> <literal>` comparison.
+
+    Outside the WHERE clause such a comparison is currently handed to Postgres
+    verbatim, which runs the raw `answer` UDF and string-compares its free-form
+    prose against the literal - so `CASE WHEN answer(notes, q) = 'Yes'` is
+    almost always false even when the model says yes. These are exactly the
+    shapes that can instead be routed through the same verification path a WHERE
+    predicate takes.
+    """
+    if not isinstance(node, A_Expr) or node.kind != A_Expr_Kind.AEXPR_OP:
+        return False
+    if len(node.name) != 1 or not isinstance(node.name[0], String):
+        return False
+
+    lexpr_is_free_text = _if_contains_free_text_fcn(node.lexpr)
+    rexpr_is_free_text = _if_contains_free_text_fcn(node.rexpr)
+    if lexpr_is_free_text == rexpr_is_free_text:
+        # free text on both sides, or on neither - nothing to verify
+        return False
+
+    free_text_clause = node.lexpr if lexpr_is_free_text else node.rexpr
+    value_clause = node.rexpr if lexpr_is_free_text else node.lexpr
+
+    # `lower(answer(...)) = 'yes'` and friends wrap the call in a normalizing
+    # function. The free text call has to be the operand itself for the rewrite
+    # to stay type-correct, since the replacement is a boolean.
+    if not _if_free_text_fcn(free_text_clause):
+        return False
+    args = free_text_clause.args if free_text_clause.args else ()
+    if len(args) < 2:
+        return False
+    if not (isinstance(args[1], A_Const) and isinstance(args[1].val, String)):
+        return False
+
+    # the compared-against value has to be a literal - it is what gets shown to
+    # the verification prompt as the candidate answer
+    return isinstance(value_clause, A_Const) and isinstance(
+        value_clause.val, (String, Integer)
+    )
+
+
+class _ProjectionPredicateVisitor(Visitor):
+    """Collects `answer(...) <op> <literal>` comparisons, and (when `replace` is
+    set) swaps each one for a reference to the synthetic boolean column the
+    compiler materializes for it."""
+
+    def __init__(self, replace=False) -> None:
+        super().__init__()
+        self.replace = replace
+        self.res: Dict[str, tuple] = {}
+
+    def __call__(self, node):
+        if node is None:
+            return
+        return super().__call__(node)
+
+    def visit_SelectStmt(self, ancestors, node: SelectStmt):
+        # A nested SelectStmt (e.g. a scalar subquery in the target list) owns
+        # its own projection; the outer visitor reaches it separately.
+        if node is not self.root:
+            return Skip
+
+    def visit_A_Expr(self, ancestors, node: A_Expr):
+        if not _if_projection_predicate(node):
+            return
+
+        lexpr_is_free_text = _if_contains_free_text_fcn(node.lexpr)
+        free_text_clause = node.lexpr if lexpr_is_free_text else node.rexpr
+        value_clause = node.rexpr if lexpr_is_free_text else node.lexpr
+
+        text_arg, query = _free_text_fcn_args(free_text_clause)
+        if _contains_aggregate(text_arg):
+            raise NotImplementedError(
+                "the text argument of a free text function outside the WHERE "
+                "clause is evaluated once per input row, so it cannot contain "
+                "an aggregate: {}".format(RawStream()(free_text_clause))
+            )
+
+        value = (
+            value_clause.val.sval
+            if isinstance(value_clause.val, String)
+            else value_clause.val.ival
+        )
+        alias = _projection_predicate_alias(RawStream()(node))
+        self.res[alias] = (text_arg, query, node.name[0].sval, value)
+
+        if self.replace:
+            return ColumnRef(fields=(String(sval=alias),))
+
+
+@contextmanager
+def _only_projection_clauses(node: SelectStmt):
+    """Hides the parts of a SelectStmt that the compiler handles elsewhere, so a
+    visitor sees only the projection, HAVING, GROUP BY and ORDER BY.
+
+    The WHERE clause has its own (retrieval-backed) pipeline; CTE bodies are
+    materialized by `_process_ctes`; FROM-clause subqueries are separate
+    SelectStmts that the outer visitor reaches on its own.
+    """
+    saved = (node.whereClause, node.withClause, node.fromClause)
+    node.whereClause = None
+    node.withClause = None
+    node.fromClause = None
+    try:
+        yield
+    finally:
+        node.whereClause, node.withClause, node.fromClause = saved
+
+
+def _extract_projection_predicates(node: SelectStmt, replace=False):
+    """Free text comparisons living outside the WHERE clause, keyed by the
+    synthetic boolean column each will be materialized under."""
+    visitor = _ProjectionPredicateVisitor(replace=replace)
+    with _only_projection_clauses(node):
+        visitor(node)
+    return visitor.res
+
+
+def _expand_star_targets(node: SelectStmt, column_info):
+    """Replaces a bare `*` in the target list with the explicit column list.
+
+    Needed once the compiler appends synthetic boolean columns to the temp
+    table: `SELECT *` against that table would otherwise hand the user the
+    compiler's internal columns.
+    """
+    names = [
+        x[0]
+        for x in column_info
+        if not str(x[0]).startswith(_INTERNAL_PRED_COLUMN_PREFIX)
+    ]
+    expanded = []
+    changed = False
+    for target in node.targetList or ():
+        if (
+            isinstance(target, ResTarget)
+            and isinstance(target.val, ColumnRef)
+            and len(target.val.fields) == 1
+            and isinstance(target.val.fields[0], A_Star)
+        ):
+            changed = True
+            expanded.extend(
+                ResTarget(val=ColumnRef(fields=(String(sval=name),))) for name in names
+            )
+        else:
+            expanded.append(target)
+    if changed:
+        node.targetList = tuple(expanded)
+
+
+def _if_limit_pushdown_safe(node: SelectStmt):
+    """Whether the query's LIMIT can be applied while fetching the rows that
+    projection predicates will be verified against.
+
+    A projection predicate filters nothing, so the rows the query outputs are
+    already determined by the structural part - unless something downstream can
+    reorder or regroup them first.
+
+    An OFFSET is excluded because the rewritten query runs against the temp
+    table and would apply the same OFFSET a second time, skipping past rows that
+    were already skipped once.
+    """
+    return (
+        node.limitCount is not None
+        and node.limitOffset is None
+        and not node.groupClause
+        and not node.havingClause
+        and not node.sortClause
+        and not node.distinctClause
+    )
+
+
+def _extract_compiler_evaluated_computed_text_args(node: SelectStmt):
+    """Computed text arguments of free text functions in every clause the
+    compiler evaluates itself - the WHERE clause plus, since these comparisons
+    are now verified rather than executed, the projection / HAVING / GROUP BY /
+    ORDER BY."""
+    res = dict(_extract_computed_text_args(node.whereClause))
+    for clause in (
+        node.targetList,
+        node.havingClause,
+        node.groupClause,
+        node.sortClause,
+    ):
+        if clause:
+            res.update(_extract_computed_text_args(clause))
+    return res
+
+
+# Number of verification calls kept in flight. These are HTTP round trips to an
+# LLM, so the useful number is a function of the provider's rate limits, not of
+# the local core count (which is what an unconfigured ThreadPoolExecutor uses).
+_DEFAULT_MAX_VERIFICATION_WORKERS = 32
+
+
+def _resolve_max_workers(max_workers=None):
+    if max_workers is not None:
+        return max(1, int(max_workers))
+    from_env = os.environ.get("SUQL_MAX_VERIFICATION_WORKERS")
+    if from_env:
+        try:
+            return max(1, int(from_env))
+        except ValueError:
+            logging.warning(
+                "ignoring non-integer SUQL_MAX_VERIFICATION_WORKERS=%r", from_env
+            )
+    return _DEFAULT_MAX_VERIFICATION_WORKERS
+
+
+def _parallel_map(fcn, items, max_workers=None):
+    """Runs `fcn` over `items` concurrently, preserving input order.
+
+    Like `_parallel_filtering` this is an I/O-bound fan-out (each call waits on
+    an LLM HTTP response), and it copies the calling context into each worker so
+    the per-query cost tracker stays visible. Unlike `_parallel_filtering` there
+    is no early exit and results are keyed by position, so duplicate items are
+    handled correctly.
+    """
+    if not items:
+        return []
+    results = [None] * len(items)
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=_resolve_max_workers(max_workers)
+    ) as executor:
+        futures = {
+            executor.submit(contextvars.copy_context().run, fcn, item): index
+            for index, item in enumerate(items)
+        }
+        for future in concurrent.futures.as_completed(futures):
+            results[futures[future]] = future.result()
+    return results
+
+
 def _extract_all_free_text_fcns(suql):
     node = parse_sql(suql)
     visitor = _ExtractAllFreeTextFncs()
@@ -359,9 +669,12 @@ class _SelectVisitor(Visitor):
         port="5432",
         disable_retriever=False,
         enable_classifier=False,
+        max_verification_workers=None,
     ) -> None:
         super().__init__()
         self.tmp_tables = []
+        # concurrency cap for verification LLM calls (see _resolve_max_workers)
+        self.max_verification_workers = max_verification_workers
         # this cache is to store classifier results for sturctured fields (e.g. cuisines in restaurants)
         self.cache = defaultdict(dict)
         self.fts_fields = fts_fields
@@ -432,47 +745,99 @@ class _SelectVisitor(Visitor):
             else:
                 self._process_ctes(node)
 
-        if not node.whereClause:
+        # `answer(...) = 'Yes'` outside the WHERE clause (in the projection,
+        # HAVING or ORDER BY) is verified by the compiler too, rather than being
+        # left for Postgres to run as the raw UDF and string-compare.
+        # Detect it up front so a query with no WHERE clause at all still gets
+        # compiled.
+        has_projection_predicates = bool(_extract_projection_predicates(node))
+
+        if not node.whereClause and not has_projection_predicates:
             return
 
         # First, understand whether this involves subquery. If it does, then starts with that first and builds upwards
         # If that subquery in turn involves other subqueries, then recursive calls take care of it
-        subquery_visitor = _IfInvovlesSubquery()
-        subquery_visitor(node)
-        sublinks = subquery_visitor.return_top_level_sublinks()
-        for sublink in sublinks:
-            self.visit_SelectStmt(None, sublink)
+        if node.whereClause:
+            subquery_visitor = _IfInvovlesSubquery()
+            subquery_visitor(node)
+            sublinks = subquery_visitor.return_top_level_sublinks()
+            for sublink in sublinks:
+                self.visit_SelectStmt(None, sublink)
 
         freeTextFcnVisitor = _FreeTextFcnVisitor()
         freeTextFcnVisitor(node.whereClause)
 
-        if freeTextFcnVisitor.res:
+        if freeTextFcnVisitor.res or has_projection_predicates:
             tmp_table_name = "temp_table_{}".format(_generate_random_string())
 
-            # main entry point for SUQL compiler optimization
-            results, column_info = _analyze_SelectStmt(
-                node,
-                self.database,
-                self.cache,
-                self.fts_fields,
-                self.embedding_server_address,
-                self.select_username,
-                self.select_userpswd,
-                self.table_w_ids,
-                self.llm_model_name,
-                self.max_verify,
-                self.api_base,
-                self.api_version,
-                self.api_key,
-                disable_retriever=self.disable_retriever,
-                cte_column_lineage=self.cte_column_lineage,
-                enable_classifier=self.enable_classifier,
-            )
+            if freeTextFcnVisitor.res:
+                # main entry point for SUQL compiler optimization
+                results, column_info = _analyze_SelectStmt(
+                    node,
+                    self.database,
+                    self.cache,
+                    self.fts_fields,
+                    self.embedding_server_address,
+                    self.select_username,
+                    self.select_userpswd,
+                    self.table_w_ids,
+                    self.llm_model_name,
+                    self.max_verify,
+                    self.api_base,
+                    self.api_version,
+                    self.api_key,
+                    disable_retriever=self.disable_retriever,
+                    cte_column_lineage=self.cte_column_lineage,
+                    enable_classifier=self.enable_classifier,
+                )
+            else:
+                # Nothing to retrieve on - the WHERE clause is purely
+                # structural. Run it as-is to get the rows the query will
+                # output, so the projection predicates can be verified per row.
+                results, column_info = _execute_structural_sql(
+                    node,
+                    self.database,
+                    node.whereClause,
+                    self.cache,
+                    self.fts_fields,
+                    self.select_username,
+                    self.select_userpswd,
+                    self.llm_model_name,
+                    self.api_base,
+                    self.api_version,
+                    self.api_key,
+                    self.host,
+                    self.port,
+                    enable_classifier=self.enable_classifier,
+                    preserve_limit=_if_limit_pushdown_safe(node),
+                )
+
+            if has_projection_predicates:
+                # Re-extract now that _execute_structural_sql has had its chance
+                # to rewrite join column references, and replace each comparison
+                # with the boolean column it is about to be materialized under.
+                projection_predicates = _extract_projection_predicates(
+                    node, replace=True
+                )
+                results, column_info = _verify_projection_predicates(
+                    node,
+                    projection_predicates,
+                    results,
+                    column_info,
+                    self.llm_model_name,
+                    self.api_base,
+                    self.api_version,
+                    self.api_key,
+                    max_workers=self.max_verification_workers,
+                )
 
             # computed text expressions given to answer() are projected under
             # internal aliases (issue #50) - they have served their purpose by
             # now and must not leak into the temp table or the user's results
             results, column_info = _drop_internal_columns(results, column_info)
+
+            if has_projection_predicates:
+                _expand_star_targets(node, column_info)
 
             # based on results and column_info, insert a temporary table
             column_create_stmt = ",\n".join(
@@ -1230,7 +1595,9 @@ def _verify_single_res(
     return all_found
 
 
-def _parallel_filtering(fcn, source: list, limit, enforce_ordering=False):
+def _parallel_filtering(
+    fcn, source: list, limit, enforce_ordering=False, max_workers=None
+):
     true_count = 0
     true_items = set()
 
@@ -1238,7 +1605,9 @@ def _parallel_filtering(fcn, source: list, limit, enforce_ordering=False):
     # which indicates whether an item has been verified
     ordered_results = {i: None for i in range(len(source))}
 
-    with concurrent.futures.ThreadPoolExecutor() as executor:
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=_resolve_max_workers(max_workers)
+    ) as executor:
         futures = {
             executor.submit(contextvars.copy_context().run, fcn, item): item
             for item in source
@@ -1277,6 +1646,147 @@ def _parallel_filtering(fcn, source: list, limit, enforce_ordering=False):
         return res
 
     return true_items
+
+
+def _resolve_projection_text_source(text_arg, node: SelectStmt, single_table, column_names):
+    """Where in the structural query's rows the text argument of a projection
+    predicate can be read from. Returns `(field, column_index)`, where `field`
+    is the usual `(table, column)` tuple or a `_ComputedTextField`."""
+    if isinstance(text_arg, ColumnRef):
+        parts = tuple(x.sval for x in text_arg.fields if isinstance(x, String))
+        if len(parts) != len(text_arg.fields):
+            raise ValueError(
+                "the text argument of a free text function must name a column "
+                "or be a text expression, but is a wildcard: {}".format(
+                    RawStream()(text_arg)
+                )
+            )
+        if single_table:
+            table = node.fromClause[0].relname
+            column = parts[-1]
+            target = column
+        elif len(parts) == 2:
+            table, column = parts
+            target = "{}^{}".format(table, column)
+        else:
+            # Either a join whose column refs _Replace_Original_Target_Visitor
+            # already flattened to "table^column", or a FROM shape that projects
+            # the column under its own name (e.g. a subquery).
+            target = parts[0]
+            if target not in column_names:
+                matches = [c for c in column_names if c.endswith("^" + target)]
+                if len(matches) != 1:
+                    raise ValueError(
+                        "cannot tell which table the text argument {} belongs "
+                        "to; qualify it with a table name".format(target)
+                    )
+                target = matches[0]
+            table, _, column = target.partition("^")
+            if not column:
+                table, column = "", target
+        field = (table, column)
+    else:
+        if not single_table:
+            raise NotImplementedError(
+                "a computed text expression given to answer() outside the WHERE "
+                "clause is only supported for single-table queries; got: "
+                "{}".format(RawStream()(text_arg))
+            )
+        expr_sql = RawStream()(text_arg)
+        target = _computed_text_alias(expr_sql)
+        field = _ComputedTextField(
+            table=node.fromClause[0].relname,
+            column=target,
+            expr_sql=expr_sql,
+        )
+
+    if target not in column_names:
+        raise ValueError(
+            "the structural query did not project {}, needed to verify "
+            "answer({}, ...)".format(target, RawStream()(text_arg))
+        )
+    return field, column_names.index(target)
+
+
+def _verify_projection_predicates(
+    node: SelectStmt,
+    projection_predicates,
+    results,
+    column_info,
+    llm_model_name,
+    api_base=None,
+    api_version=None,
+    api_key=None,
+    max_workers=None,
+):
+    """Evaluates free text comparisons that sit outside the WHERE clause, and
+    appends one synthetic boolean column per comparison to the structural
+    results.
+
+    A WHERE predicate gets to prune, so it can be answered from the top-k the
+    retriever returns. A projection cannot: the query has to emit a value for
+    every row it outputs, and a row the retriever happens to miss would silently
+    become a false negative in the user's aggregate. So there is no retrieval
+    step here - every surviving row is verified.
+
+    That makes this rows x predicates LLM calls, all mutually independent, which
+    is the easy case for concurrency: they go into one flat pool rather than
+    being nested per row (`_verify_single_res` short-circuits on the first false
+    predicate, which is right for a filter and wrong here, since every
+    predicate's value is needed regardless).
+    """
+    single_table = len(node.fromClause) == 1 and isinstance(
+        node.fromClause[0], RangeVar
+    )
+    column_names = [x[0] for x in column_info]
+
+    plan = []
+    for alias, (text_arg, query, operator, value) in sorted(
+        projection_predicates.items()
+    ):
+        field, column_index = _resolve_projection_text_source(
+            text_arg, node, single_table, column_names
+        )
+        plan.append((alias, column_index, field, query, operator, value))
+
+    tasks = [(row, entry) for row in results for entry in plan]
+
+    def verify_one(task):
+        row, (_, column_index, field, query, operator, value) = task
+        document = row[column_index]
+        # NULL text can never satisfy the predicate
+        if document is None:
+            return False
+        if not isinstance(document, str):
+            document = str(document)
+        return _verify(
+            document,
+            field,
+            query,
+            operator,
+            value,
+            llm_model_name,
+            api_base,
+            api_version,
+            api_key,
+        )
+
+    start_time = time.time()
+    verdicts = _parallel_map(verify_one, tasks, max_workers=max_workers)
+    logging.info(
+        "verified %d projection predicate value(s) over %d row(s) in %.2fs",
+        len(tasks),
+        len(results),
+        time.time() - start_time,
+    )
+
+    width = len(plan)
+    new_results = [
+        tuple(row) + tuple(verdicts[i * width : (i + 1) * width])
+        for i, row in enumerate(results)
+    ]
+    new_column_info = list(column_info) + [(entry[0], "boolean") for entry in plan]
+    return new_results, new_column_info
 
 
 # Upper bound on how many rows the compiler is willing to send to the LLM when
@@ -2155,8 +2665,13 @@ def _execute_structural_sql(
     host="127.0.0.1",
     port="5432",
     enable_classifier=False,
+    preserve_limit=False,
 ):
     _ = RawStream()(original_node)  # RawStream takes care of some issue, to investigate
+    # Collect these before the join branch below rewrites `t.col` references in
+    # the projection into the flat "t^col" form: the structural query has to
+    # evaluate the expression against the real tables, using the original names.
+    computed_text_args = _extract_compiler_evaluated_computed_text_args(original_node)
     node = deepcopy(original_node)
     # change projection to include everything
     # there are a couple of cases here
@@ -2274,15 +2789,18 @@ def _execute_structural_sql(
     # evaluates them once per row, and the LLM verification step can read the
     # resulting string off each row (see issue #50). These columns are internal
     # and get stripped before results are returned (_drop_internal_columns).
-    computed_text_args = _extract_computed_text_args(original_node.whereClause)
     node.targetList = tuple(node.targetList) + tuple(
         ResTarget(name=alias, val=deepcopy(expr))
         for alias, expr in sorted(computed_text_args.items())
     )
 
-    # reset all limits
-    node.limitCount = None
-    node.limitOffset = None
+    # reset all limits. `preserve_limit` is set when the caller only needs the
+    # rows the final query will actually output and nothing downstream can
+    # change which rows those are - a projection predicate filters nothing, so
+    # the LIMIT can be pushed down and bound the number of LLM calls.
+    if not preserve_limit:
+        node.limitCount = None
+        node.limitOffset = None
     # change predicates
     node.whereClause = predicate
     # reset other unecessary clauses
@@ -3042,6 +3560,7 @@ def suql_execute(
     debug_log=None,
     disable_retriever=False,
     enable_classifier=False,
+    max_verification_workers=None,
 ):
     """
     Main entry point to the SUQL Python-based compiler.
@@ -3104,6 +3623,11 @@ def suql_execute(
         column's distinct values. Useful for natural-language queries against enum-like columns.
         Defaults to False because the current implementation walks into CTE bodies / subqueries
         and emits spurious probe SQLs there (see issue #52). Set to True to opt in.
+
+    `max_verification_workers` (int, optional): How many verification LLM calls to keep in
+        flight. These are I/O-bound HTTP round trips, so the useful value tracks the provider's
+        rate limits rather than the local core count. Defaults to 32, overridable process-wide
+        with the `SUQL_MAX_VERIFICATION_WORKERS` environment variable.
 
     # Returns:
     `results` (List[[*]]): A list of returned database results. Each inner list stores a row of returned result.
@@ -3198,6 +3722,7 @@ def suql_execute(
             statement_timeout=statement_timeout,
             disable_retriever=disable_retriever,
             enable_classifier=enable_classifier,
+            max_verification_workers=max_verification_workers,
         )
     finally:
         _query_tracker.reset(token)
@@ -3261,6 +3786,7 @@ def _suql_execute_single(
     statement_timeout=30000,
     disable_retriever=False,
     enable_classifier=False,
+    max_verification_workers=None,
 ):
     results = []
     column_names = []
@@ -3285,6 +3811,7 @@ def _suql_execute_single(
             port=port,
             disable_retriever=disable_retriever,
             enable_classifier=enable_classifier,
+            max_verification_workers=max_verification_workers,
         )
         root = parse_sql(suql)
         visitor(root)

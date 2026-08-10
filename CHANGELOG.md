@@ -6,6 +6,26 @@ All notable changes to SUQL are documented in this file. Format loosely follows
 ## [Unreleased]
 
 ### Fixed
+- **`answer()` comparisons outside the WHERE clause.**
+  `CASE WHEN answer(notes, q) = 'Yes' THEN 1 ELSE 0 END` in a SELECT list
+  returned 0 for rows the model had answered correctly, with no error — silently
+  under-counting aggregates. Only `node.whereClause` was ever compiled, so a
+  comparison in the projection was handed to Postgres, which ran the raw
+  plpython3u UDF (whose prompt is open-ended: "Answer a question based on the
+  following text") and byte-compared its free-form prose against the literal.
+  `Yes. A nuclear power station is part of energy infrastructure.` is not
+  `'Yes'`. It also varied run to run, because `prompt_continuation` forces
+  `temperature=1` for the gpt-5 family regardless of the caller's request.
+  The compiler now recognises `answer(...) <op> <literal>` in the projection,
+  `HAVING`, `GROUP BY` and `ORDER BY`, verifies each one per row through the
+  same path a WHERE predicate takes, and materializes the result as a synthetic
+  boolean column. A bare `SELECT *` alongside such a predicate is expanded to
+  the explicit column list so the synthetic column doesn't leak. Uses that want
+  the model's prose (`SELECT answer(notes, 'which city?')`), comparisons against
+  a non-literal, and calls wrapped in another function (`lower(answer(...))`)
+  are left for Postgres as before; an aggregate in the text argument raises
+  `NotImplementedError` rather than silently collapsing to one row.
+
 - **`answer()` over a computed text expression (issue #50).** The text argument
   of a free-text function no longer has to be a bare column: `answer(COALESCE(a,
   '') || ' ' || COALESCE(b, ''), '...')`, `answer(lower(notes), '...')` and any
@@ -27,6 +47,20 @@ All notable changes to SUQL are documented in this file. Format loosely follows
   the original table name as an alias.
 - `answer()` on a NULL text value is now `False` instead of raising an
   `AssertionError` inside verification.
+
+### Changed
+- **Verification LLM calls are explicitly pooled.** Both the WHERE-side filter
+  and the new projection-side path run their verifications through a thread pool
+  sized by `max_verification_workers` (new `suql_execute(...)` parameter,
+  default 32, overridable process-wide with `SUQL_MAX_VERIFICATION_WORKERS`).
+  Previously `_parallel_filtering` constructed an unconfigured
+  `ThreadPoolExecutor`, whose size is `min(32, cpu_count + 4)` — a function of
+  the local core count, when the real ceiling is the LLM provider's rate limit.
+  A projection predicate cannot prune, so it is verified on every output row;
+  the calls are all mutually independent and go into one flat pool rather than
+  being nested per row. Where the query's `LIMIT` cannot be changed by anything
+  downstream (no `GROUP BY`/`HAVING`/`ORDER BY`/`DISTINCT`), it is pushed down
+  ahead of verification, which bounds the number of LLM calls.
 
 ## [1.1.10a3] - 2026-05-13
 

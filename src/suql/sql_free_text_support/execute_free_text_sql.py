@@ -439,6 +439,49 @@ def _expand_star_targets(node: SelectStmt, column_info):
         node.targetList = tuple(expanded)
 
 
+def _single_rangevar_relname(from_clause):
+    """The relname of `from_clause`, when it is exactly one plain table
+    reference; None otherwise."""
+    if (
+        from_clause
+        and len(from_clause) == 1
+        and isinstance(from_clause[0], RangeVar)
+    ):
+        return from_clause[0].relname
+    return None
+
+
+def _if_body_is_bare_select_star(body: SelectStmt):
+    """True when `body` is exactly `SELECT * FROM <one table>` - i.e. the table
+    it reads from already *is* the body's result, so downstream references can
+    be pointed straight at that table."""
+    target_list = body.targetList or ()
+    if len(target_list) != 1:
+        return False
+    target = target_list[0]
+    if not (
+        isinstance(target, ResTarget)
+        and isinstance(target.val, ColumnRef)
+        and len(target.val.fields) == 1
+        and isinstance(target.val.fields[0], A_Star)
+    ):
+        return False
+    if _single_rangevar_relname(body.fromClause) is None:
+        return False
+    return not any(
+        (
+            body.whereClause,
+            body.groupClause,
+            body.havingClause,
+            body.sortClause,
+            body.distinctClause,
+            body.limitCount,
+            body.limitOffset,
+            body.withClause,
+        )
+    )
+
+
 def _if_limit_pushdown_safe(node: SelectStmt):
     """Whether the query's LIMIT can be applied while fetching the rows that
     projection predicates will be verified against.
@@ -896,12 +939,21 @@ class _SelectVisitor(Visitor):
             # Alias the temp table back to that name so those references keep
             # resolving. Joins don't need this - _Replace_Original_Target_Visitor
             # already rewrote their references to the "table^column" form.
+            # A CTE body whose FROM was already swapped for an upstream temp
+            # table carries an alias naming the relation the rest of the body
+            # refers to (see _rewrite_cte_refs). _replace_table_aliases skips
+            # temp tables, so that alias is still the name in use and must be
+            # carried over; otherwise fall back to the real table's name, which
+            # is what _replace_table_aliases rewrote references to.
             original_from = node.fromClause
-            table_alias = (
-                Alias(aliasname=original_from[0].relname)
-                if len(original_from) == 1 and isinstance(original_from[0], RangeVar)
-                else None
-            )
+            table_alias = None
+            if len(original_from) == 1 and isinstance(original_from[0], RangeVar):
+                source = original_from[0]
+                table_alias = Alias(
+                    aliasname=source.alias.aliasname
+                    if source.alias is not None
+                    else source.relname
+                )
             node.fromClause = (
                 RangeVar(
                     relname=tmp_table_name,
@@ -975,6 +1027,16 @@ class _SelectVisitor(Visitor):
             # (its surrounding WITH lives on the OUTER SelectStmt).
             self._rewrite_cte_refs(cte.ctequery, cte_to_tmp)
 
+            # Do this before inferring the ID column. Only a CTE materialized
+            # as *input* to a later answer() needs the ID added: one that
+            # carries answer() itself is materialized by _execute_structural_sql,
+            # whose `SELECT *` already brings the ID across from its source.
+            # Restricting it this way also keeps the added column out of the
+            # answer()-bearing CTE's own projection, so `SELECT * FROM <cte>`
+            # still returns what the user asked for.
+            if name in needs_mat and not _if_contains_free_text_fcn(cte.ctequery):
+                self._augment_cte_projection_with_id(cte.ctequery)
+
             id_col = self._infer_cte_id_column(cte.ctequery)
             # Build column lineage from the (now rewritten) body. Composes
             # through self.cte_column_lineage for sources that are
@@ -985,6 +1047,12 @@ class _SelectVisitor(Visitor):
             self.cte_column_lineage[name] = lineage
 
             if name in needs_mat:
+                # What this body reads from *before* we try to materialize it.
+                # _rewrite_cte_refs may already have pointed it at an upstream
+                # CTE's temp table, which must not be mistaken for this CTE's
+                # own materialization below.
+                before = _single_rangevar_relname(cte.ctequery.fromClause)
+
                 if _if_contains_free_text_fcn(cte.ctequery):
                     # Body has answer(); the natural visit_SelectStmt path
                     # creates a temp table and rewrites the body in place.
@@ -996,11 +1064,29 @@ class _SelectVisitor(Visitor):
                     # `FROM <this_cte>` once we rewrite it.
                     self._materialize_cte_body_directly(cte.ctequery)
 
-                from_cls = cte.ctequery.fromClause
-                if (from_cls and len(from_cls) == 1
-                        and isinstance(from_cls[0], RangeVar)
-                        and from_cls[0].relname.startswith("temp_table_")):
-                    tmp_name = from_cls[0].relname
+                # Downstream references are redirected to a temp table only if
+                # that table holds this CTE's *output*. Two ways that fails:
+                #   - visit_SelectStmt returned without materializing (nothing
+                #     for the compiler to evaluate, e.g. a bare `answer(...)`
+                #     projection with no comparison), leaving `before` in place;
+                #   - it did materialize, but the body still carries a real
+                #     projection, so the temp table is that projection's *input*
+                #     and lacks the columns the body computes.
+                # Either way, redirecting downstream would drop those columns
+                # (`column "..." does not exist`). Materialize the body's own
+                # output instead.
+                after = _single_rangevar_relname(cte.ctequery.fromClause)
+                if (
+                    after is None
+                    or after == before
+                    or not after.startswith("temp_table_")
+                    or not _if_body_is_bare_select_star(cte.ctequery)
+                ):
+                    self._materialize_cte_body_directly(cte.ctequery)
+                    after = _single_rangevar_relname(cte.ctequery.fromClause)
+
+                if after is not None and after.startswith("temp_table_"):
+                    tmp_name = after
                     cte_to_tmp[name] = tmp_name
                     # Also register lineage under the temp table name so
                     # cross-CTE refs (which target the temp name after our
@@ -1091,7 +1177,16 @@ class _SelectVisitor(Visitor):
     @staticmethod
     def _rewrite_cte_refs(body, mapping):
         """Replace `RangeVar.relname` with `mapping[relname]` wherever the
-        relname is a key in `mapping`. In-place AST mutation."""
+        relname is a key in `mapping`. In-place AST mutation.
+
+        The name the surrounding query uses to refer to the relation is kept as
+        an alias. Without it, swapping `base` for `temp_table_xxx` orphans every
+        qualified reference in the same body - `SELECT base.event_id_cnty ...
+        FROM base` becomes `SELECT base.event_id_cnty ... FROM temp_table_xxx`,
+        which Postgres rejects with `missing FROM-clause entry for table
+        "base"`. An explicit alias (`FROM base b`) is already the name in use,
+        so it is left alone.
+        """
         if not mapping:
             return
 
@@ -1099,9 +1194,46 @@ class _SelectVisitor(Visitor):
             def visit_RangeVar(self, ancestors, node):
                 if (node.schemaname is None and node.catalogname is None
                         and node.relname in mapping):
+                    if node.alias is None:
+                        node.alias = Alias(aliasname=node.relname)
                     node.relname = mapping[node.relname]
 
         _Rewriter()(body)
+
+    def _augment_cte_projection_with_id(self, body):
+        """Add the source relation's ID column to a to-be-materialized CTE's
+        projection when the CTE drops it.
+
+        A materialized CTE becomes an ordinary table that the SUQL pipeline then
+        runs against, and that pipeline needs a row ID: `_retrieve_and_verify`
+        keys the retriever's `id_list` and its per-row dedup on it. A CTE like
+        `SELECT country, admin1, notes FROM events` throws the ID away, leaving
+        the temp table unregistrable in `table_w_ids` - which used to surface
+        downstream as a bare `KeyError: 'temp_table_xxx'`.
+
+        Only safe for a straight row-wise projection: with GROUP BY, DISTINCT or
+        an aggregate there is no row to identify, and the extra column would not
+        even be valid SQL. Those cases keep no ID and are reported by
+        `_retrieve_and_verify` instead.
+        """
+        rel = _single_rangevar_relname(body.fromClause)
+        if rel is None or rel not in self.table_w_ids:
+            return
+        if body.groupClause or body.distinctClause or body.havingClause:
+            return
+        target_list = body.targetList or ()
+        if _contains_aggregate(target_list):
+            return
+
+        id_col = self.table_w_ids[rel]
+        source = body.fromClause[0]
+        qualifier = source.alias.aliasname if source.alias is not None else rel
+        if self._projection_includes(target_list, qualifier, id_col):
+            return
+
+        body.targetList = tuple(target_list) + (
+            ResTarget(val=ColumnRef(fields=(String(sval=id_col),))),
+        )
 
     def _infer_cte_id_column(self, body):
         """Best-effort: figure out which row-ID column this CTE's temp table
@@ -1941,7 +2073,20 @@ def _retrieve_and_verify(
     )
 
     if len(node.fromClause) == 1 and isinstance(node.fromClause[0], RangeVar):
-        id_field_name = table_w_ids[node.fromClause[0].relname]
+        relname = node.fromClause[0].relname
+        if relname not in table_w_ids:
+            # A materialized CTE with no usable row ID - typically one that
+            # aggregates (GROUP BY / DISTINCT), so there is no row to identify.
+            # Used to escape as a bare `KeyError: 'temp_table_xxx'`.
+            raise NotImplementedError(
+                "answer() is applied to a relation with no known ID column: "
+                "{}. If this is a CTE, project the source table's ID column "
+                "in it (one of: {}) so rows can be identified for retrieval "
+                "and de-duplication.".format(
+                    relname, ", ".join(sorted(table_w_ids.values())) or "none known"
+                )
+            )
+        id_field_name = table_w_ids[relname]
         single_table = True
         id_index = list(map(lambda x: x[0], column_info)).index(id_field_name)
         id_list = list(map(lambda x: x[id_index], existing_results))

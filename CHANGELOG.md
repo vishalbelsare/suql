@@ -6,6 +6,34 @@ All notable changes to SUQL are documented in this file. Format loosely follows
 ## [Unreleased]
 
 ### Fixed
+- **CTE materialization dropped information the rest of the query needed.**
+  Four distinct failures, all from materializing a CTE containing `answer()`
+  and then losing something across the boundary. Reported together from one
+  pipeline run in which 12/12 SUQL executions failed.
+  - *The name a CTE is referred to by.* `_rewrite_cte_refs` swapped
+    `RangeVar.relname` for the temp table without keeping the old name, so
+    `SELECT base.event_id_cnty ... FROM base` became `... FROM temp_table_xxx`
+    and Postgres rejected it with `missing FROM-clause entry for table "base"`.
+    The same happened to an explicit alias (`FROM base b` … `SELECT b.*`),
+    which `visit_SelectStmt` then overwrote with the temp table's own name. The
+    referenced name is now preserved as an alias, and an existing alias is
+    carried across instead of being replaced.
+  - *The CTE's own output columns.* A CTE was treated as "materialized" if its
+    FROM clause named a temp table — which is also true when it merely *reads*
+    from an upstream CTE's temp table. Downstream references were then
+    redirected to that upstream table, dropping every column the body computed
+    (`column "russian_yes" does not exist`). Redirection now requires that the
+    body actually reduce to `SELECT * FROM <temp table>`; when it does not, the
+    body's own output is materialized first.
+  - *The row ID.* A CTE that does not project its source table's ID column
+    (`SELECT country, admin1, notes FROM events`) could not be registered in
+    `table_w_ids`, and a downstream `answer()` failed with a bare
+    `KeyError: 'temp_table_xxx'`. The ID is now added back to such a CTE before
+    it is materialized. Only CTEs materialized as *input* to a later `answer()`
+    are touched, so this does not change what `SELECT * FROM <cte>` returns.
+  - *Cases that genuinely have no row ID* (a CTE that aggregates) now raise an
+    actionable `NotImplementedError` naming the relation and the ID columns it
+    could project, instead of a `KeyError` on an internal table name.
 - **`answer()` comparisons outside the WHERE clause.**
   `CASE WHEN answer(notes, q) = 'Yes' THEN 1 ELSE 0 END` in a SELECT list
   returned 0 for rows the model had answered correctly, with no error — silently

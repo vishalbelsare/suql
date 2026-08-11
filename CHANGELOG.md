@@ -3,7 +3,15 @@
 All notable changes to SUQL are documented in this file. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [1.1.10a4] - 2026-08-11
+
+### Changed (behavioural — read before upgrading)
+- **`answer(...)` verification is now capped at $1.00 per query by default.**
+  Previously nothing bounded it. A query that used to run to completion while
+  spending more than that now raises `SUQLCostLimitExceeded` instead of
+  returning results. Pass `max_verification_cost=<usd>` to raise the ceiling,
+  or `0` to restore the old unbounded behaviour. See the entry below for why
+  the default is on rather than opt-in.
 
 ### Added
 - **Per-query verification cost ceiling (`max_verification_cost`, default

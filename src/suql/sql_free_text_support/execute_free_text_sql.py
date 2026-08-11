@@ -7,6 +7,7 @@ import os
 import random
 import re
 import string
+import threading
 import time
 import traceback
 from collections import defaultdict
@@ -539,6 +540,170 @@ def _resolve_max_workers(max_workers=None):
                 "ignoring non-integer SUQL_MAX_VERIFICATION_WORKERS=%r", from_env
             )
     return _DEFAULT_MAX_VERIFICATION_WORKERS
+
+
+class SUQLCostLimitExceeded(RuntimeError):
+    """Raised when a query's verification spend hits (or is projected to hit)
+    the per-query cost/call ceiling. Deliberately loud: the alternative is
+    returning a partial filter as if it were the complete answer."""
+
+
+# Per-query verification budget. A ContextVar so it reaches the worker threads
+# in _parallel_map / _parallel_filtering, both of which run tasks under
+# contextvars.copy_context().
+_verification_budget: contextvars.ContextVar = contextvars.ContextVar(
+    "_verification_budget", default=None
+)
+
+# Default ceiling on what one suql_execute() call may spend on verification.
+_DEFAULT_MAX_VERIFICATION_COST = 1.0
+
+# Real LLM calls to observe before extrapolating a batch's total cost. Small
+# enough to be negligible against any sane ceiling, large enough to smooth out
+# per-document length variation.
+_COST_PROJECTION_SAMPLE = 25
+
+
+class _VerificationBudget:
+    """Hard ceiling on verification spend for a single query.
+
+    Two mechanisms, because a ceiling alone is not enough:
+
+    - **Stop**: before every verification the accumulated spend is checked, so a
+      query can never run past its ceiling.
+    - **Refuse early**: a query whose plan is 4.3M verifications should not
+      spend its entire ceiling discovering that. After a small sample of real
+      calls, the mean cost per verification is extrapolated over the number
+      still planned; if that projection exceeds the ceiling, the query is
+      refused immediately with the numbers that justify it.
+
+    The projection is measured per *verification attempt*, not per LLM call, so
+    documents served from the `_verified_res` memo cache are accounted for
+    rather than inflating the estimate.
+
+    Only spend made in this process is visible here. `answer()` evaluated by
+    Postgres as the raw plpython3u UDF calls the free-text server directly and
+    is not counted; that path is reported by `/stats/<query_id>` after the fact.
+    """
+
+    def __init__(self, max_cost=None, max_calls=None, tracker=None):
+        self.max_cost = max_cost
+        self.max_calls = max_calls
+        self._tracker = tracker
+        self._lock = threading.Lock()
+        self._planned = 0
+        self._attempts = 0
+        self._tripped = None
+
+    def _spend(self):
+        if self._tracker is None:
+            return 0.0, 0
+        with self._tracker["_lock"]:
+            return self._tracker["cost"], self._tracker["calls"]
+
+    def register_planned(self, count):
+        """Declare `count` more verifications are about to be attempted."""
+        with self._lock:
+            self._planned += max(0, int(count))
+
+    def snapshot(self):
+        cost, calls = self._spend()
+        with self._lock:
+            return {
+                "cost": cost,
+                "llm_calls": calls,
+                "verifications": self._attempts,
+                "planned": self._planned,
+                "max_cost": self.max_cost,
+                "max_calls": self.max_calls,
+            }
+
+    def _trip(self, message):
+        with self._lock:
+            if self._tripped is None:
+                self._tripped = message
+        raise SUQLCostLimitExceeded(self._tripped)
+
+    def before_verification(self):
+        """Called immediately before each verification. Raises to stop the query."""
+        with self._lock:
+            if self._tripped is not None:
+                raise SUQLCostLimitExceeded(self._tripped)
+            self._attempts += 1
+            attempts = self._attempts
+            planned = self._planned
+
+        cost, calls = self._spend()
+
+        if self.max_calls is not None and calls >= self.max_calls:
+            self._trip(
+                "verification call limit reached: {} LLM calls (limit {}), "
+                "${:.4f} spent. Narrow the query with structural predicates or "
+                "raise max_verification_calls.".format(calls, self.max_calls, cost)
+            )
+
+        if self.max_cost is None:
+            return
+
+        if cost >= self.max_cost:
+            self._trip(
+                "verification cost limit reached: ${:.4f} spent over {} LLM "
+                "call(s) (limit ${:.2f}). Narrow the query with structural "
+                "predicates, add a LIMIT, or raise "
+                "max_verification_cost.".format(cost, calls, self.max_cost)
+            )
+
+        # Extrapolate once there is enough signal, so an unaffordable plan is
+        # refused after cents rather than after the whole ceiling.
+        if calls >= _COST_PROJECTION_SAMPLE and planned > attempts:
+            per_verification = cost / attempts
+            projected = per_verification * planned
+            if projected > self.max_cost:
+                self._trip(
+                    "refusing to continue: {:,} verifications are planned and "
+                    "the first {:,} cost ${:.4f} (${:.6f} each), so this query "
+                    "projects to ${:.2f} - over the ${:.2f} limit. Narrow the "
+                    "query with structural predicates, add a LIMIT, or raise "
+                    "max_verification_cost.".format(
+                        planned, attempts, cost, per_verification,
+                        projected, self.max_cost,
+                    )
+                )
+
+
+def _resolve_verification_budget(max_cost, max_calls, tracker):
+    """Builds the per-query budget, applying env overrides and the default
+    ceiling. `max_cost=0` (or a negative value) disables the cost ceiling."""
+
+    def _from_env(name, cast):
+        raw = os.environ.get(name)
+        if not raw:
+            return None
+        try:
+            return cast(raw)
+        except ValueError:
+            logging.warning("ignoring non-numeric %s=%r", name, raw)
+            return None
+
+    if max_cost is None:
+        max_cost = _from_env("SUQL_MAX_VERIFICATION_COST", float)
+    if max_cost is None:
+        max_cost = _DEFAULT_MAX_VERIFICATION_COST
+    if max_cost is not None and max_cost <= 0:
+        max_cost = None
+
+    if max_calls is None:
+        max_calls = _from_env("SUQL_MAX_VERIFICATION_CALLS", int)
+    if max_calls is not None and max_calls <= 0:
+        max_calls = None
+
+    return _VerificationBudget(max_cost=max_cost, max_calls=max_calls, tracker=tracker)
+
+
+def _register_planned_verifications(count):
+    budget = _verification_budget.get()
+    if budget is not None:
+        budget.register_planned(count)
 
 
 def _parallel_map(fcn, items, max_workers=None):
@@ -1582,6 +1747,13 @@ def _verify(
     if (document, field, query, operator, value) in _verified_res:
         return _verified_res[(document, field, query, operator, value)]
 
+    # Every compiler-side verification funnels through here, so this is where
+    # the per-query ceiling is enforced. Raises SUQLCostLimitExceeded to stop
+    # the query rather than returning a half-applied filter.
+    budget = _verification_budget.get()
+    if budget is not None:
+        budget.before_verification()
+
     # construct the answer part
     if operator == "=":
         answer = value
@@ -1882,6 +2054,9 @@ def _verify_projection_predicates(
         plan.append((alias, column_index, field, query, operator, value))
 
     tasks = [(row, entry) for row in results for entry in plan]
+    # Declare the size of the plan so the budget can refuse an unaffordable
+    # one after a sample rather than after spending the whole ceiling.
+    _register_planned_verifications(len(tasks))
 
     def verify_one(task):
         row, (_, column_index, field, query, operator, value) = task
@@ -2234,6 +2409,12 @@ def _retrieve_and_verify(
             if res not in filtered_parsed_result:
                 filtered_parsed_result.append(res)
         parsed_result = filtered_parsed_result
+
+    # Upper bound on the verifications this batch can attempt: every candidate
+    # row against every predicate. _verify_single_res short-circuits on the
+    # first predicate a row fails, so the real count is often lower - but the
+    # budget must be told the worst case it is being asked to fund.
+    _register_planned_verifications(len(parsed_result) * max(1, len(field_query_list)))
 
     if parallel:
         # parallelize verification calls
@@ -3706,6 +3887,8 @@ def suql_execute(
     disable_retriever=False,
     enable_classifier=False,
     max_verification_workers=None,
+    max_verification_cost=None,
+    max_verification_calls=None,
 ):
     """
     Main entry point to the SUQL Python-based compiler.
@@ -3774,6 +3957,21 @@ def suql_execute(
         rate limits rather than the local core count. Defaults to 32, overridable process-wide
         with the `SUQL_MAX_VERIFICATION_WORKERS` environment variable.
 
+    `max_verification_cost` (float, optional): Hard ceiling, in USD, on what this query may
+        spend verifying `answer(...)` predicates. Defaults to $1.00; override process-wide with
+        `SUQL_MAX_VERIFICATION_COST`, or pass `0` to remove the ceiling. Enforced two ways: the
+        accumulated spend is checked before every verification, and once enough calls have been
+        made to measure a mean, the cost of the remaining planned verifications is extrapolated
+        — so a query that would cost far more is refused after cents rather than after the whole
+        budget. Exceeding it raises `SUQLCostLimitExceeded`; a partial filter is never returned
+        as if it were the complete answer. Note this covers compiler-side verification only —
+        `answer()` left in a projection for Postgres to run calls the free-text server directly
+        and is reported after the fact via `/stats/<query_id>`.
+
+    `max_verification_calls` (int, optional): Ceiling on the number of verification LLM calls,
+        as an alternative to (or alongside) the cost ceiling. Off by default; override with
+        `SUQL_MAX_VERIFICATION_CALLS`.
+
     # Returns:
     `results` (List[[*]]): A list of returned database results. Each inner list stores a row of returned result.
 
@@ -3819,6 +4017,13 @@ def suql_execute(
     query_id = str(uuid4())
     tracker = make_query_tracker()
     token = set_query_tracker(tracker)
+
+    # Per-query verification ceiling. Installed on a ContextVar so it reaches
+    # the verification worker threads, which run under copy_context().
+    budget = _resolve_verification_budget(
+        max_verification_cost, max_verification_calls, tracker
+    )
+    budget_token = _verification_budget.set(budget)
 
     # Per-call I/O logging. `debug_log=True` writes to the default path;
     # passing a string uses that path; None/False disables.
@@ -3871,6 +4076,7 @@ def suql_execute(
         )
     finally:
         _query_tracker.reset(token)
+        _verification_budget.reset(budget_token)
 
     # Collect SELECT-projection answer() costs from the free text server
     flask_stats = {"cost": 0.0, "calls": 0}
@@ -3887,6 +4093,8 @@ def suql_execute(
     cache["_stats"] = {
         "cost": tracker["cost"] + flask_stats.get("cost", 0.0),
         "calls": tracker["calls"] + flask_stats.get("calls", 0),
+        "verifications": budget.snapshot()["verifications"],
+        "max_verification_cost": budget.max_cost,
     }
 
     if results == []:

@@ -5,6 +5,44 @@ All notable changes to SUQL are documented in this file. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+- **Per-query verification cost ceiling (`max_verification_cost`, default
+  $1.00).** Nothing previously bounded what one query could spend verifying
+  `answer(...)` predicates. A reported run ground for 25 hours on 4,326,211
+  verification calls costing $101.51 without a single query completing — broad
+  free-text predicates over a large candidate set. Parallelising verification
+  made that faster, not cheaper.
+
+  Enforced at `_verify`, the single point every compiler-side verification
+  passes through, so it covers both the retriever-backed WHERE path and
+  projection predicates. Two mechanisms:
+  - *Stop*: accumulated spend is checked before every verification, so a query
+    can never run past its ceiling.
+  - *Refuse early*: after a small sample of real calls (25), the mean cost per
+    verification is extrapolated over the number still planned; if the
+    projection exceeds the ceiling the query is refused immediately. A plan of
+    176,660 verifications is now refused in ~12 seconds having spent $0.0006,
+    with a message giving the plan size, the measured rate, the projection and
+    the limit.
+
+  Exceeding the ceiling raises `SUQLCostLimitExceeded` (exported from `suql`)
+  rather than returning a half-applied filter as if it were the complete
+  answer. Cost is projected per verification *attempt*, so documents served
+  from the `_verified_res` memo cache do not inflate the estimate; the planned
+  count for a multi-predicate WHERE clause is an upper bound, so the projection
+  errs toward refusing. Override per call, or process-wide with
+  `SUQL_MAX_VERIFICATION_COST`; pass `0` to remove the ceiling.
+  `max_verification_calls` (and `SUQL_MAX_VERIFICATION_CALLS`) caps the call
+  count instead. `cache["_stats"]` now also reports `verifications` and
+  `max_verification_cost`.
+
+  Scope: this bounds spend made in the SUQL process. `answer()` left in a
+  projection for Postgres to evaluate as the raw plpython3u UDF calls the
+  free-text server directly and is not covered; that path is still only visible
+  after the fact via `/stats/<query_id>`. The ceiling is also per
+  `suql_execute` call — a pipeline issuing many queries needs its own aggregate
+  budget on top.
+
 ### Fixed
 - **CTE materialization dropped information the rest of the query needed.**
   Four distinct failures, all from materializing a CTE containing `answer()`
